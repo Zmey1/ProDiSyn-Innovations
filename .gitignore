@@ -4,6 +4,3 @@
 # Keep the three notebooks
 !fall_detection_pipeline_hf_model.ipynb
 !fall_detection_realtime_local.ipynb
-
-# Keep git config files
-!.gitignore
