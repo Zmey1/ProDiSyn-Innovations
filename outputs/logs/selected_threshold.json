@@ -1,0 +1,15 @@
+{
+  "selected_fall_threshold": 0.15,
+  "selection_rule": "recall>=0.70 then max precision, else max F1",
+  "selected_metrics": {
+    "threshold": 0.15,
+    "accuracy": 0.47621951219512193,
+    "precision": 0.29061371841155237,
+    "recall": 0.8151898734177215,
+    "f1": 0.42847638057218895,
+    "false_positives": 786.0,
+    "false_negatives": 73.0,
+    "true_positives": 322.0,
+    "true_negatives": 459.0
+  }
+}

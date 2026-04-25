@@ -1,7 +1,15 @@
 # Ignore everything by default
 *
 
-# Keep the three notebooks
-!fall_detection_pipeline_hf_model.ipynb
-!fall_detection_realtime_local.ipynb
-!fall-detection-pipeline.ipynb
+# Allow gitignore itself
+!.gitignore
+
+# Allow local notebook
+!local.ipynb
+
+# Allow outputs/logs and outputs/checkpoints (not tracks)
+!outputs/
+!outputs/logs/
+!outputs/logs/**
+!outputs/checkpoints/
+!outputs/checkpoints/**
