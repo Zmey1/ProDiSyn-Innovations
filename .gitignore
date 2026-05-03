@@ -1,15 +1,21 @@
-# Ignore everything by default
+# Ignore everything by default (whitelist approach)
 *
 
-# Allow gitignore itself
+# Meta
 !.gitignore
+!TEST_DOCUMENTATION.md
 
-# Allow local notebook
+# Main notebook
 !local.ipynb
 
-# Allow outputs/logs and outputs/checkpoints (not tracks)
+# Training outputs
 !outputs/
 !outputs/logs/
 !outputs/logs/**
 !outputs/checkpoints/
 !outputs/checkpoints/**
+
+# Excluded (large): outputs/tracks/, outputs/urfall_mp4/
+# Excluded (large): archive/, archive_ur/, GMDCSA24-*/
+# Excluded (sensitive): client_secret*.json
+# Excluded (binary): yolov8n-pose.pt, *.zip

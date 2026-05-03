@@ -1,0 +1,2 @@
+video_name,track_id,event_start_frame,event_end_frame,confidence,mode_used,label
+video (1).mp4,270,41,157,0.9208890795707703,cnn,fall
