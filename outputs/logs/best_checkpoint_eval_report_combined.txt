@@ -1,15 +1,15 @@
-Best checkpoint epoch: 2
-Best checkpoint val F1: 0.5886402753872634
+Best checkpoint epoch: 5
+Best checkpoint val F1: 0.5363984674329502
 
               precision    recall  f1-score   support
 
-      normal       0.86      0.84      0.85      2391
-        fall       0.58      0.60      0.59       854
+      normal       0.85      0.86      0.85      2443
+        fall       0.54      0.53      0.54       795
 
-    accuracy                           0.78      3245
-   macro avg       0.72      0.72      0.72      3245
-weighted avg       0.78      0.78      0.78      3245
+    accuracy                           0.78      3238
+   macro avg       0.70      0.69      0.69      3238
+weighted avg       0.77      0.78      0.77      3238
 
 Confusion matrix:
-[[2015  376]
- [ 341  513]]
+[[2092  351]
+ [ 375  420]]
