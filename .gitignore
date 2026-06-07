@@ -3,38 +3,16 @@
 
 # Meta
 !.gitignore
-!TEST_DOCUMENTATION.md
+!CLAUDE.md
 .env
 
-# Main notebook
-!local.ipynb
+# Notebooks
+!local_v3_yolov8n.ipynb  # Evidence: 2-class appearance-based failed (27% detection)
+!local_v4_kaggle.ipynb   # V4: 4-class multi-class approach (target >90% detection)
 
-# Training outputs
-!outputs/
-!outputs/logs/
-!outputs/logs/**
-!outputs/checkpoints/
-!outputs/checkpoints/**
-
-# V2 notebook and related files
-!local_v2.ipynb
+# Validation data
 !shared_val_manifest.json
-!v3_results.json
-!v3_fixed_results.json
 !occlusion_test_videos.json
 
-# V2 training run outputs
-!runs/
-!runs/detect/
-!runs/detect/fall_detector_v2/
-!runs/detect/fall_detector_v2/multiclass-4/
-!runs/detect/fall_detector_v2/multiclass-4/results.csv
-!runs/detect/fall_detector_v2/multiclass-4/*.png
-!runs/detect/fall_detector_v2/multiclass-4/weights/
-!runs/detect/fall_detector_v2/multiclass-4/weights/best.pt
-
-# Excluded (large): outputs/tracks/, outputs/urfall_mp4/
-# Excluded (large): archive/, archive_ur/, GMDCSA24-*/
-# Excluded (large): Fall-Detection-1/ (downloaded Roboflow dataset)
-# Excluded (sensitive): client_secret*.json
-# Excluded (binary): yolov8n-pose.pt, *.zip
+# extras/ folder contains all supporting files (datasets, old notebooks, models, etc.)
+# Already ignored by default due to * pattern above
