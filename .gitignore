@@ -7,8 +7,7 @@
 .env
 
 # Notebooks
-!local_v3_yolov8n.ipynb  # Evidence: 2-class appearance-based failed (27% detection)
-!local_v4_kaggle.ipynb   # V4: 4-class multi-class approach (target >90% detection)
+
 
 # Validation data
 !shared_val_manifest.json
