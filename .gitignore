@@ -4,15 +4,16 @@
 # Meta
 !.gitignore
 !CLAUDE.md
-.env
+!README.md
 
-# Notebooks
-!local_v3_yolov8n.ipynb  # Evidence: 2-class appearance-based failed (27% detection)
-!local_v4_kaggle.ipynb   # V4: 4-class multi-class approach (target >90% detection)
+# Final V1 Pipeline
+!local_f_kaggle.ipynb
 
-# Validation data
-!shared_val_manifest.json
-!occlusion_test_videos.json
+# Manifests
+!manifests/
+!manifests/*.json
 
-# extras/ folder contains all supporting files (datasets, old notebooks, models, etc.)
-# Already ignored by default due to * pattern above
+# Results & Model
+!results/
+!results/v4_final/
+!results/v4_final/*
