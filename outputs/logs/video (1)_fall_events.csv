@@ -1,5 +1,0 @@
-video_name,track_id,event_start_frame,event_end_frame,confidence,mode_used,label
-video (1).mp4,270,70,89,0.7374141216278076,cnn,fall
-video (1).mp4,270,93,93,0.571969747543335,cnn,fall
-video (1).mp4,270,110,110,0.6283182501792908,cnn,fall
-video (1).mp4,270,119,141,0.652633547782898,cnn,fall
