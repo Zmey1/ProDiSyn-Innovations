@@ -80,3 +80,41 @@ def test_cnn_model_output_is_logits():
     probs = torch.softmax(output, dim=1)
 
     assert probs.sum().item() == pytest.approx(1.0, abs=1e-5)
+
+
+def test_falldetector_loads_model(tmp_path):
+    import torch
+    from cnn_fall_detector import FallDetector, FallCNN1D
+
+    dummy_model = FallCNN1D()
+    ckpt_path = tmp_path / "dummy.pt"
+    torch.save({"model_state_dict": dummy_model.state_dict()}, ckpt_path)
+
+    detector = FallDetector(str(ckpt_path), device="cpu")
+
+    assert detector.model is not None
+    assert detector.threshold == 0.7
+    assert detector.seq_len == 30
+
+
+def test_falldetector_predict_window(tmp_path):
+    import torch
+    from cnn_fall_detector import FallDetector, FallCNN1D, SEQ_LEN, NUM_KEYPOINTS
+
+    dummy_model = FallCNN1D()
+    ckpt_path = tmp_path / "dummy.pt"
+    torch.save({"model_state_dict": dummy_model.state_dict()}, ckpt_path)
+
+    detector = FallDetector(str(ckpt_path), device="cpu")
+
+    window = [{
+        "bbox_xyxy": [100, 100, 200, 300],
+        "keypoints": [[150, 150, 0.9] for _ in range(NUM_KEYPOINTS)],
+        "frame_w": 640,
+        "frame_h": 480,
+    } for _ in range(SEQ_LEN)]
+
+    is_fall, conf = detector.predict_window(window)
+
+    assert isinstance(is_fall, bool)
+    assert 0.0 <= conf <= 1.0

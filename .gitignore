@@ -17,3 +17,8 @@
 !results/
 !results/v4_final/
 !results/v4_final/*
+
+# CNN Fall Detector Module
+!cnn_fall_detector.py
+!tests/
+!tests/test_cnn_fall_detector.py
