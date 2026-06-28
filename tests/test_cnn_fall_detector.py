@@ -1,5 +1,10 @@
+import os
+
 import numpy as np
 import pytest
+
+MODEL_PATH = "runs/meow1/fall_cnn1d_v4_best.pt"
+TEST_VIDEO = "Fall-Detection-v4-industrial/urfall_mp4/fall-01-cam0-rgb.mp4"
 
 
 def test_normalize_keypoints_centers_at_bbox():
@@ -118,3 +123,21 @@ def test_falldetector_predict_window(tmp_path):
 
     assert isinstance(is_fall, bool)
     assert 0.0 <= conf <= 1.0
+
+
+@pytest.mark.skipif(
+    not os.path.exists(MODEL_PATH) or not os.path.exists(TEST_VIDEO),
+    reason="Model or test video not available"
+)
+def test_integration_real_video():
+    from cnn_fall_detector import FallDetector
+    detector = FallDetector(MODEL_PATH, device="cpu")
+    events = detector.run_on_video(TEST_VIDEO, progress=False)
+    assert isinstance(events, list)
+    for e in events:
+        assert "video_name" in e
+        assert "start_frame" in e
+        assert "end_frame" in e
+        assert "confidence" in e
+        assert e["start_frame"] <= e["end_frame"]
+        assert 0.0 <= e["confidence"] <= 1.0
