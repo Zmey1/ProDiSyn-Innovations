@@ -266,3 +266,143 @@ class FallDetector:
 
         self._finalize_events()
         return self.events
+
+    def run_on_video_annotated(
+        self,
+        video_path: str,
+        output_path: str,
+        progress: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Process video and create annotated output with fall markers."""
+        events = self.run_on_video(video_path, progress=progress)
+
+        fall_frames = set()
+        for event in events:
+            for f in range(event["start_frame"], event["end_frame"] + 1):
+                fall_frames.add(f)
+
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+
+            if frame_idx in fall_frames:
+                cv2.putText(
+                    frame, "FALL DETECTED", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3
+                )
+                cv2.rectangle(frame, (40, 20), (350, 70), (0, 0, 255), 2)
+
+            writer.write(frame)
+
+            if progress and frame_idx % 100 == 0:
+                print(f"  Writing {frame_idx}/{total}", end="\r")
+
+        cap.release()
+        writer.release()
+
+        if progress:
+            print()
+
+        return events
+
+
+def main() -> int:
+    """CLI entry point for fall detection inference."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        description="CNN-based fall detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  python cnn_fall_detector.py video.mp4
+  python cnn_fall_detector.py video.mp4 --annotate output.mp4
+  python cnn_fall_detector.py video.mp4 -o results.json --threshold 0.8
+  python cnn_fall_detector.py videos/*.mp4 -o all_results.json
+        """,
+    )
+    parser.add_argument("videos", nargs="*", help="Video file(s) to process")
+    parser.add_argument(
+        "--model", default="runs/meow1/fall_cnn1d_v4_best.pt",
+        help="Model checkpoint path",
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=THRESHOLD,
+        help=f"Detection threshold (default: {THRESHOLD})",
+    )
+    parser.add_argument("--device", help="Device: cuda, cpu, mps")
+    parser.add_argument("-o", "--output", help="JSON output file")
+    parser.add_argument(
+        "--annotate", metavar="PATH",
+        help="Create annotated video (single video only)",
+    )
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress progress")
+
+    args = parser.parse_args()
+
+    if not args.videos:
+        parser.print_help()
+        return 1
+
+    if not Path(args.model).exists():
+        print(f"Error: Model not found: {args.model}")
+        return 1
+
+    if args.annotate and len(args.videos) > 1:
+        print("Error: --annotate only works with a single video")
+        return 1
+
+    print(f"Loading model: {args.model}")
+    detector = FallDetector(args.model, threshold=args.threshold, device=args.device)
+    print(f"Device: {detector.device}, Threshold: {detector.threshold}")
+
+    all_events = []
+    for video_path in args.videos:
+        if not Path(video_path).exists():
+            print(f"Warning: Skipping missing video: {video_path}")
+            continue
+
+        print(f"Processing: {video_path}")
+
+        if args.annotate:
+            events = detector.run_on_video_annotated(
+                video_path, args.annotate, progress=not args.quiet
+            )
+            print(f"Annotated video: {args.annotate}")
+        else:
+            events = detector.run_on_video(video_path, progress=not args.quiet)
+
+        all_events.extend(events)
+
+        if events:
+            print(f"  Found {len(events)} fall event(s):")
+            for e in events:
+                print(f"    Track {e['track_id']}: frames {e['start_frame']}-{e['end_frame']} "
+                      f"(conf={e['confidence']:.2f})")
+        else:
+            print("  No falls detected")
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(all_events, f, indent=2)
+        print(f"Results: {args.output}")
+
+    print(f"\nTotal: {len(all_events)} fall(s) in {len(args.videos)} video(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
