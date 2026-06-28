@@ -20,5 +20,6 @@
 
 # CNN Fall Detector Module
 !cnn_fall_detector.py
+!usage.md
 !tests/
 !tests/test_cnn_fall_detector.py
