@@ -23,3 +23,11 @@
 !usage.md
 !tests/
 !tests/test_cnn_fall_detector.py
+
+# Additional modules and model
+!fall_detector.py
+!eval_rule_based.py
+!tracker.py
+!runs/
+!runs/v4/
+!runs/v4/fall_cnn1d_v4_best.pt
