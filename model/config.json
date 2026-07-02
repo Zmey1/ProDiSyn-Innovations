@@ -1,0 +1,49 @@
+{
+  "_name_or_path": "local-videomae-fall-model",
+  "architectures": [
+    "VideoMAEForVideoClassification"
+  ],
+  "attention_probs_dropout_prob": 0.0,
+  "decoder_hidden_size": 384,
+  "decoder_intermediate_size": 1536,
+  "decoder_num_attention_heads": 6,
+  "decoder_num_hidden_layers": 4,
+  "hidden_act": "gelu",
+  "hidden_dropout_prob": 0.0,
+  "hidden_size": 768,
+  "id2label": {
+    "0": "FallDown",
+    "1": "LyingDown",
+    "2": "SitDown",
+    "3": "Sitting",
+    "4": "StandUp",
+    "5": "Standing",
+    "6": "Walking"
+  },
+  "image_size": 224,
+  "initializer_range": 0.02,
+  "intermediate_size": 3072,
+  "label2id": {
+    "FallDown": 0,
+    "LyingDown": 1,
+    "SitDown": 2,
+    "Sitting": 3,
+    "StandUp": 4,
+    "Standing": 5,
+    "Walking": 6
+  },
+  "layer_norm_eps": 1e-12,
+  "model_type": "videomae",
+  "norm_pix_loss": false,
+  "num_attention_heads": 12,
+  "num_channels": 3,
+  "num_frames": 16,
+  "num_hidden_layers": 12,
+  "patch_size": 16,
+  "problem_type": "single_label_classification",
+  "qkv_bias": true,
+  "torch_dtype": "float32",
+  "transformers_version": "4.39.0",
+  "tubelet_size": 2,
+  "use_mean_pooling": true
+}
