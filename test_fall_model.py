@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -100,57 +103,196 @@ def _open_video(video_path: str | Path) -> tuple[cv2.VideoCapture, int, float]:
     return capture, frame_count, fps
 
 
-def _sample_frame_range(
+def _resize_shortest_edge(frame: np.ndarray, target_shortest_edge: int) -> np.ndarray:
+    """Downscale so the shorter side equals target_shortest_edge (no-op if already smaller).
+
+    Matches the processor's own resize target (preprocessor_config.json:
+    size.shortest_edge=224), so this produces the same crop the processor
+    would compute from the raw frame, just without decoding/resizing at
+    full 4K first.
+    """
+
+    height, width = frame.shape[:2]
+    shortest_edge = min(height, width)
+    if shortest_edge <= target_shortest_edge:
+        return frame
+    scale = target_shortest_edge / shortest_edge
+    new_size = (round(width * scale), round(height * scale))
+    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+
+_FFMPEG_HWACCEL_AVAILABLE: bool | None = None
+
+
+def _ffmpeg_hwaccel_available() -> bool:
+    """Cache whether ffmpeg with CUDA/NVDEC hwaccel is usable on this machine."""
+
+    global _FFMPEG_HWACCEL_AVAILABLE
+    if _FFMPEG_HWACCEL_AVAILABLE is not None:
+        return _FFMPEG_HWACCEL_AVAILABLE
+    if shutil.which("ffmpeg") is None:
+        _FFMPEG_HWACCEL_AVAILABLE = False
+        return False
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hwaccels"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        _FFMPEG_HWACCEL_AVAILABLE = "cuda" in result.stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        _FFMPEG_HWACCEL_AVAILABLE = False
+    return _FFMPEG_HWACCEL_AVAILABLE
+
+
+def _decode_all_frames_ffmpeg(
     video_path: str | Path,
-    start_frame: int,
-    end_frame: int,
-    num_frames: int,
-) -> list[np.ndarray]:
-    """Sample RGB frames uniformly from an inclusive frame range."""
+    target_shortest_edge: int,
+) -> list[np.ndarray] | None:
+    """Decode via ffmpeg's NVDEC hwaccel, scaling at decode time. None on any failure."""
 
-    if num_frames <= 0:
-        raise ValueError("num_frames must be positive")
+    probe = cv2.VideoCapture(str(video_path))
+    width = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe.release()
+    if width <= 0 or height <= 0:
+        return None
 
-    capture, frame_count, _ = _open_video(video_path)
-    last_frame = frame_count - 1
-    start_frame = int(np.clip(start_frame, 0, last_frame))
-    end_frame = int(np.clip(end_frame, start_frame, last_frame))
-    target_indices = np.linspace(
-        start_frame,
-        end_frame,
-        num=num_frames,
-    ).round().astype(int)
+    shortest_edge = min(width, height)
+    if shortest_edge > target_shortest_edge:
+        scale = target_shortest_edge / shortest_edge
+        out_width = round(width * scale)
+        out_height = round(height * scale)
+    else:
+        out_width, out_height = width, height
+    out_width -= out_width % 2
+    out_height -= out_height % 2
+    if out_width <= 0 or out_height <= 0:
+        return None
+
+    frame_bytes = out_width * out_height * 3
+    command = [
+        "ffmpeg",
+        "-hwaccel", "cuda",
+        "-i", str(video_path),
+        "-vf", f"scale={out_width}:{out_height}",
+        "-pix_fmt", "rgb24",
+        "-f", "rawvideo",
+        "-",
+    ]
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        return None
 
     frames: list[np.ndarray] = []
     try:
-        for frame_index in target_indices:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        assert process.stdout is not None
+        while True:
+            buffer = process.stdout.read(frame_bytes)
+            if len(buffer) < frame_bytes:
+                break
+            frame = np.frombuffer(buffer, dtype=np.uint8).reshape(
+                (out_height, out_width, 3)
+            )
+            frames.append(frame.copy())
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return None
+
+    if process.returncode != 0 or not frames:
+        return None
+    return frames
+
+
+def _decode_all_frames_cv2(
+    video_path: str | Path,
+    target_shortest_edge: int | None = None,
+) -> list[np.ndarray]:
+    """Decode every frame sequentially (no seeking), downscaling as it goes."""
+
+    capture, frame_count, _ = _open_video(video_path)
+    frames: list[np.ndarray] = []
+    try:
+        for _ in range(frame_count):
             ok, frame = capture.read()
             if not ok:
-                raise RuntimeError(
-                    f"Could not decode frame {frame_index} from {video_path}"
-                )
+                break
+            if target_shortest_edge is not None:
+                frame = _resize_shortest_edge(frame, target_shortest_edge)
             frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     finally:
         capture.release()
 
+    if not frames:
+        raise RuntimeError(f"Could not decode any frames from {video_path}")
     return frames
+
+
+def decode_video_frames(
+    video_path: str | Path,
+    target_shortest_edge: int | None = None,
+) -> list[np.ndarray]:
+    """Decode every frame of the video once, downscaled to target_shortest_edge.
+
+    Callers that need multiple analysis passes over the same video (whole-
+    video + sliding-window) should decode once here and pass the result to
+    both, instead of letting each pass re-decode overlapping regions.
+    """
+
+    if target_shortest_edge is not None and _ffmpeg_hwaccel_available():
+        frames = _decode_all_frames_ffmpeg(video_path, target_shortest_edge)
+        if frames is not None:
+            return frames
+    return _decode_all_frames_cv2(video_path, target_shortest_edge)
+
+
+def _select_indices(
+    num_available: int,
+    start_frame: int,
+    end_frame: int,
+    num_frames: int,
+) -> np.ndarray:
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive")
+    last_frame = num_available - 1
+    start_frame = int(np.clip(start_frame, 0, last_frame))
+    end_frame = int(np.clip(end_frame, start_frame, last_frame))
+    return np.linspace(start_frame, end_frame, num=num_frames).round().astype(int)
 
 
 def sample_uniform_frames(
     video_path: str | Path,
     num_frames: int = 16,
+    target_shortest_edge: int | None = None,
+    frames: list[np.ndarray] | None = None,
 ) -> list[np.ndarray]:
-    """Sample frames uniformly across the complete video."""
+    """Sample frames uniformly across the complete video.
 
-    capture, frame_count, _ = _open_video(video_path)
-    capture.release()
-    return _sample_frame_range(
-        video_path,
-        start_frame=0,
-        end_frame=frame_count - 1,
-        num_frames=num_frames,
-    )
+    Pass a pre-decoded `frames` list (from `decode_video_frames`) to avoid
+    re-decoding when the caller already decoded this video for another pass.
+    """
+
+    if frames is None:
+        frames = decode_video_frames(video_path, target_shortest_edge)
+    indices = _select_indices(len(frames), 0, len(frames) - 1, num_frames)
+    return [frames[i] for i in indices]
+
+
+def _processor_shortest_edge(processor: Any) -> int:
+    """Read the processor's configured resize target instead of a guessed constant."""
+
+    size = getattr(processor, "size", None) or {}
+    return int(size.get("shortest_edge", 224))
 
 
 def predict_frames(
@@ -195,12 +337,23 @@ def predict_video_whole(
     model: Any,
     processor: Any,
     device: torch.device,
+    frames: list[np.ndarray] | None = None,
 ) -> dict[str, Any]:
-    """Predict one clip sampled uniformly across the entire video."""
+    """Predict one clip sampled uniformly across the entire video.
+
+    Pass a pre-decoded `frames` list (from `decode_video_frames`) when the
+    caller is also running `analyze_video_sliding` on the same video, to
+    avoid decoding it twice.
+    """
 
     num_frames = int(getattr(model.config, "num_frames", 16))
-    frames = sample_uniform_frames(video_path, num_frames=num_frames)
-    return predict_frames(frames, model, processor, device)
+    sampled = sample_uniform_frames(
+        video_path,
+        num_frames=num_frames,
+        target_shortest_edge=_processor_shortest_edge(processor),
+        frames=frames,
+    )
+    return predict_frames(sampled, model, processor, device)
 
 
 def classify_events(
@@ -369,8 +522,15 @@ def analyze_video_sliding(
     stride_seconds: float = 1.0,
     threshold: float = 0.7,
     consecutive_required: int = 2,
+    frames: list[np.ndarray] | None = None,
 ) -> pd.DataFrame:
-    """Run VideoMAE on fixed-duration clips across the complete video."""
+    """Run VideoMAE on fixed-duration clips across the complete video.
+
+    Pass a pre-decoded `frames` list (from `decode_video_frames`) when the
+    caller is also running `predict_video_whole` on the same video, to avoid
+    decoding it twice. Otherwise the video is decoded once here, up front,
+    instead of once per overlapping sliding window.
+    """
 
     if clip_seconds <= 0 or stride_seconds <= 0:
         raise ValueError("clip_seconds and stride_seconds must be positive")
@@ -379,6 +539,9 @@ def analyze_video_sliding(
     capture.release()
     duration = frame_count / fps
     num_frames = int(getattr(model.config, "num_frames", 16))
+
+    if frames is None:
+        frames = decode_video_frames(video_path, _processor_shortest_edge(processor))
 
     if duration <= clip_seconds:
         starts = [0.0]
@@ -398,13 +561,9 @@ def analyze_video_sliding(
             frame_count - 1,
             max(start_frame, int(round(end_seconds * fps)) - 1),
         )
-        frames = _sample_frame_range(
-            video_path,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            num_frames=num_frames,
-        )
-        prediction = predict_frames(frames, model, processor, device)
+        indices = _select_indices(len(frames), start_frame, end_frame, num_frames)
+        sampled = [frames[i] for i in indices]
+        prediction = predict_frames(sampled, model, processor, device)
         scores = prediction["scores"]
         fall_down_score = float(scores.get("FallDown", 0.0))
         lying_down_score = float(scores.get("LyingDown", 0.0))
@@ -439,6 +598,48 @@ def analyze_video_sliding(
     return pd.DataFrame(rows)
 
 
+def time_predictions(
+    video_path: str | Path,
+    model: Any,
+    processor: Any,
+    device: torch.device,
+    **sliding_kwargs: Any,
+) -> tuple[dict[str, Any], pd.DataFrame, dict[str, float]]:
+    """Run whole-video + sliding-window predictions, timing each stage.
+
+    Shared by the CLI and the GUI's Single Video / Batch tabs so timing
+    stays consistent and isn't duplicated per caller.
+    """
+
+    decode_start = time.perf_counter()
+    frames = decode_video_frames(video_path, _processor_shortest_edge(processor))
+    decode_seconds = time.perf_counter() - decode_start
+
+    whole_start = time.perf_counter()
+    whole = predict_video_whole(video_path, model, processor, device, frames=frames)
+    whole_video_seconds = time.perf_counter() - whole_start
+
+    sliding_start = time.perf_counter()
+    clip_df = analyze_video_sliding(
+        video_path, model, processor, device, frames=frames, **sliding_kwargs
+    )
+    sliding_window_seconds = time.perf_counter() - sliding_start
+
+    num_clips = len(clip_df)
+    total_seconds = decode_seconds + whole_video_seconds + sliding_window_seconds
+    timings = {
+        "decode_seconds": decode_seconds,
+        "whole_video_seconds": whole_video_seconds,
+        "sliding_window_seconds": sliding_window_seconds,
+        "num_clips": num_clips,
+        "avg_clip_ms": (
+            sliding_window_seconds / num_clips * 1000 if num_clips else 0.0
+        ),
+        "total_seconds": total_seconds,
+    }
+    return whole, clip_df, timings
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Test the pretrained VideoMAE fall detector on one video."
@@ -447,7 +648,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.7)
     parser.add_argument("--clip-seconds", type=float, default=2.0)
     parser.add_argument("--stride-seconds", type=float, default=1.0)
-    parser.add_argument("--consecutive", type=int, default=2)
+    parser.add_argument("--consecutive", type=int, default=1)
     parser.add_argument(
         "--recovery-window-seconds",
         type=float,
@@ -469,9 +670,8 @@ def _run_predictions(
     processor: Any,
     device: torch.device,
     args: argparse.Namespace,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    whole = predict_video_whole(video_path, model, processor, device)
-    clips = analyze_video_sliding(
+) -> tuple[dict[str, Any], pd.DataFrame, dict[str, float]]:
+    return time_predictions(
         video_path,
         model,
         processor,
@@ -481,7 +681,6 @@ def _run_predictions(
         threshold=args.threshold,
         consecutive_required=args.consecutive,
     )
-    return whole, clips
 
 
 def main() -> None:
@@ -508,12 +707,22 @@ def main() -> None:
     }
     print(f"Labels: {labels}")
 
-    whole, clip_df = _run_predictions(
+    whole, clip_df, timings = _run_predictions(
         video_path,
         model,
         processor,
         device,
         args,
+    )
+
+    print(
+        "\nTimings: "
+        f"decode={timings['decode_seconds']:.2f}s, "
+        f"whole_video={timings['whole_video_seconds']:.2f}s, "
+        f"sliding_window={timings['sliding_window_seconds']:.2f}s "
+        f"({timings['num_clips']} clips, "
+        f"avg {timings['avg_clip_ms']:.0f}ms/clip), "
+        f"total={timings['total_seconds']:.2f}s"
     )
 
     print(
@@ -606,6 +815,7 @@ def main() -> None:
         "recovery_threshold": args.recovery_threshold,
         "ground_threshold": args.ground_threshold,
         "whole_video_prediction": whole,
+        "timings": timings,
         **result,
     }
     json_path.write_text(json.dumps(output, indent=2) + "\n")

@@ -534,7 +534,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stride-seconds", type=float, default=1.0)
     parser.add_argument("--buffer-seconds", type=float, default=12.0)
     parser.add_argument("--threshold", type=float, default=0.7)
-    parser.add_argument("--consecutive", type=int, default=2)
+    parser.add_argument("--consecutive", type=int, default=1)
     parser.add_argument(
         "--recovery-window-seconds",
         type=float,
@@ -574,135 +574,198 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
 
 
+class WebcamSession:
+    """Drive the webcam fall-detection loop one frame at a time.
+
+    Holds all the state that main()'s while-loop used to keep in locals, so a
+    caller (CLI or GUI) can call step() repeatedly instead of owning the loop
+    itself. Behavior is identical to the original inline loop.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.output_dir = Path(args.output_dir)
+        self.model: Any = None
+        self.processor: Any = None
+        self.device: torch.device | None = None
+        self.camera: cv2.VideoCapture | None = None
+        self.frame_buffer: deque[tuple[float, np.ndarray]] = deque()
+        self.event_state = new_event_state()
+        self.current_prediction: dict[str, Any] | None = None
+        self.latest_alert: dict[str, Any] | None = None
+        self.alert_expires_at = 0.0
+        self.stream_started_at = 0.0
+        self.last_inference_at = -float("inf")
+        self.last_stream_seconds = 0.0
+        self.last_latency_seconds: float | None = None
+
+    def open(self) -> None:
+        """Load the model and open the camera."""
+
+        self.model, self.processor, self.device = load_model(self.args.device)
+        print(f"Selected device: {self.device}")
+        self.camera = open_camera(self.args.camera_index)
+        self.stream_started_at = time.monotonic()
+
+    def step(self) -> dict[str, Any]:
+        """Read one camera frame, run inference if due, return the result."""
+
+        ok, frame = self.camera.read()
+        if not ok:
+            return {"ok": False}
+
+        now = time.monotonic()
+        stream_seconds = now - self.stream_started_at
+        self.last_stream_seconds = stream_seconds
+        self.frame_buffer.append((stream_seconds, frame.copy()))
+        while (
+            self.frame_buffer
+            and stream_seconds - self.frame_buffer[0][0]
+            > self.args.buffer_seconds
+        ):
+            self.frame_buffer.popleft()
+
+        buffer_duration = (
+            self.frame_buffer[-1][0] - self.frame_buffer[0][0]
+            if len(self.frame_buffer) >= 2
+            else 0.0
+        )
+        inference_due = (
+            buffer_duration >= self.args.clip_seconds
+            and stream_seconds - self.last_inference_at
+            >= self.args.stride_seconds
+        )
+        saved_event: dict[str, Any] | None = None
+        if inference_due:
+            (
+                sampled_frames,
+                clip_start,
+                clip_end,
+                key_frame,
+            ) = sample_frames_from_buffer(
+                self.frame_buffer,
+                self.args.clip_seconds,
+                num_frames=16,
+            )
+            inference_start = time.monotonic()
+            try:
+                prediction = predict_frames(
+                    sampled_frames,
+                    self.model,
+                    self.processor,
+                    self.device,
+                )
+            except RuntimeError as exc:
+                if self.device.type != "cuda":
+                    raise
+                print(f"CUDA inference failed: {exc}")
+                print("Moving the model to CPU and continuing.")
+                self.device = torch.device("cpu")
+                try:
+                    self.model.to(self.device)
+                except RuntimeError:
+                    self.model, self.processor, self.device = load_model("cpu")
+                self.model.eval()
+                prediction = predict_frames(
+                    sampled_frames,
+                    self.model,
+                    self.processor,
+                    self.device,
+                )
+            self.last_latency_seconds = time.monotonic() - inference_start
+
+            self.current_prediction = make_prediction_row(
+                prediction,
+                clip_start,
+                clip_end,
+            )
+            self.current_prediction["_key_frame"] = key_frame
+            self.last_inference_at = stream_seconds
+            event = update_event_state(
+                self.current_prediction,
+                self.event_state,
+                self.args,
+            )
+            if event is not None:
+                saved_event = save_event_outputs(
+                    event,
+                    self.frame_buffer,
+                    self.output_dir,
+                )
+                _alert(saved_event)
+                self.latest_alert = saved_event
+                self.alert_expires_at = time.monotonic() + 5.0
+
+        if (
+            self.latest_alert is not None
+            and time.monotonic() > self.alert_expires_at
+        ):
+            self.latest_alert = None
+
+        display_frame = draw_overlay(
+            frame,
+            self.current_prediction,
+            self.event_state,
+            self.latest_alert,
+        )
+
+        return {
+            "ok": True,
+            "frame": frame,
+            "display_frame": display_frame,
+            "stream_seconds": stream_seconds,
+            "inference_ran": inference_due,
+            "prediction": self.current_prediction,
+            "latency_seconds": (
+                self.last_latency_seconds if inference_due else None
+            ),
+            "event": saved_event,
+        }
+
+    def finalize(self) -> dict[str, Any] | None:
+        """Flush a pending fall candidate at session end, if any."""
+
+        pending_event = _finalize_on_quit(
+            self.event_state,
+            self.last_stream_seconds,
+            self.args.consecutive,
+        )
+        if pending_event is None:
+            return None
+        saved_event = save_event_outputs(
+            pending_event,
+            self.frame_buffer,
+            self.output_dir,
+        )
+        _alert(saved_event)
+        return saved_event
+
+    def close(self) -> None:
+        """Release the camera."""
+
+        if self.camera is not None:
+            self.camera.release()
+        self.camera = None
+
+
 def main() -> None:
     args = _parse_args()
     _validate_args(args)
-    output_dir = Path(args.output_dir)
 
-    model, processor, device = load_model(args.device)
-    print(f"Selected device: {device}")
-    camera = open_camera(args.camera_index)
-    frame_buffer: deque[tuple[float, np.ndarray]] = deque()
-    event_state = new_event_state()
-    current_prediction: dict[str, Any] | None = None
-    latest_alert: dict[str, Any] | None = None
-    alert_expires_at = 0.0
-    stream_started_at = time.monotonic()
-    last_inference_at = -float("inf")
-    last_stream_seconds = 0.0
-
+    session = WebcamSession(args)
+    session.open()
     try:
         while True:
-            ok, frame = camera.read()
-            if not ok:
+            result = session.step()
+            if not result["ok"]:
                 print("Camera frame read failed; stopping.")
                 break
-
-            now = time.monotonic()
-            stream_seconds = now - stream_started_at
-            last_stream_seconds = stream_seconds
-            frame_buffer.append((stream_seconds, frame.copy()))
-            while (
-                frame_buffer
-                and stream_seconds - frame_buffer[0][0]
-                > args.buffer_seconds
-            ):
-                frame_buffer.popleft()
-
-            buffer_duration = (
-                frame_buffer[-1][0] - frame_buffer[0][0]
-                if len(frame_buffer) >= 2
-                else 0.0
-            )
-            inference_due = (
-                buffer_duration >= args.clip_seconds
-                and stream_seconds - last_inference_at
-                >= args.stride_seconds
-            )
-            if inference_due:
-                (
-                    sampled_frames,
-                    clip_start,
-                    clip_end,
-                    key_frame,
-                ) = sample_frames_from_buffer(
-                    frame_buffer,
-                    args.clip_seconds,
-                    num_frames=16,
-                )
-                try:
-                    prediction = predict_frames(
-                        sampled_frames,
-                        model,
-                        processor,
-                        device,
-                    )
-                except RuntimeError as exc:
-                    if device.type != "cuda":
-                        raise
-                    print(f"CUDA inference failed: {exc}")
-                    print("Moving the model to CPU and continuing.")
-                    device = torch.device("cpu")
-                    try:
-                        model.to(device)
-                    except RuntimeError:
-                        model, processor, device = load_model("cpu")
-                    model.eval()
-                    prediction = predict_frames(
-                        sampled_frames,
-                        model,
-                        processor,
-                        device,
-                    )
-
-                current_prediction = make_prediction_row(
-                    prediction,
-                    clip_start,
-                    clip_end,
-                )
-                current_prediction["_key_frame"] = key_frame
-                last_inference_at = stream_seconds
-                event = update_event_state(
-                    current_prediction,
-                    event_state,
-                    args,
-                )
-                if event is not None:
-                    saved_event = save_event_outputs(
-                        event,
-                        frame_buffer,
-                        output_dir,
-                    )
-                    _alert(saved_event)
-                    latest_alert = saved_event
-                    alert_expires_at = time.monotonic() + 5.0
-
-            if latest_alert is not None and time.monotonic() > alert_expires_at:
-                latest_alert = None
-
-            display_frame = draw_overlay(
-                frame,
-                current_prediction,
-                event_state,
-                latest_alert,
-            )
-            cv2.imshow(WINDOW_NAME, display_frame)
+            cv2.imshow(WINDOW_NAME, result["display_frame"])
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
-        pending_event = _finalize_on_quit(
-            event_state,
-            last_stream_seconds,
-            args.consecutive,
-        )
-        if pending_event is not None:
-            saved_event = save_event_outputs(
-                pending_event,
-                frame_buffer,
-                output_dir,
-            )
-            _alert(saved_event)
-        camera.release()
+        session.finalize()
+        session.close()
         cv2.destroyAllWindows()
         print("Webcam app stopped cleanly.")
 
