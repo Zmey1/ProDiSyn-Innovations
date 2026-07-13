@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -540,6 +541,13 @@ class WebcamTab(QWidget):
         self.camera_index_spin = QSpinBox()
         self.camera_index_spin.setRange(0, 8)
         top.addWidget(self.camera_index_spin)
+        top.addWidget(QLabel("RTSP/IP URL:"))
+        self.camera_url_edit = QLineEdit()
+        self.camera_url_edit.setPlaceholderText(
+            "rtsp://user:pass@host:554/stream (overrides index)"
+        )
+        self.camera_url_edit.setMinimumWidth(280)
+        top.addWidget(self.camera_url_edit)
         self.start_button = QPushButton("Start")
         self.start_button.clicked.connect(self._start)
         top.addWidget(self.start_button)
@@ -585,6 +593,7 @@ class WebcamTab(QWidget):
 
         args = SimpleNamespace(
             camera_index=self.camera_index_spin.value(),
+            camera_url=self.camera_url_edit.text().strip() or None,
             device=self.app.settings.device,
             clip_seconds=2.0,
             stride_seconds=1.0,

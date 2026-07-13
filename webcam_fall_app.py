@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections import deque
 from datetime import datetime
 import json
@@ -46,13 +47,33 @@ def load_model(device_arg: str) -> tuple[Any, Any, torch.device]:
         return load_video_model("cpu")
 
 
-def open_camera(camera_index: int) -> cv2.VideoCapture:
-    """Open a webcam and fail clearly when it is unavailable."""
+def open_camera(camera_source: int | str) -> cv2.VideoCapture:
+    """Open a local webcam or network (RTSP/HTTP) stream, failing clearly.
 
-    camera = cv2.VideoCapture(camera_index)
+    A non-numeric string source is treated as a network stream: it is opened
+    through the FFmpeg backend with TCP transport and minimal buffering so the
+    capture thread always reads the newest frame instead of a growing backlog of
+    stale frames. Behavior for integer/local-index sources is unchanged.
+    """
+
+    is_stream = isinstance(camera_source, str) and not camera_source.isdigit()
+    if is_stream:
+        # Must be set before the capture is constructed. TCP avoids torn frames
+        # (more reliable than UDP), and a low max_delay keeps latency down.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            "rtsp_transport;tcp|max_delay;500000"
+        )
+        camera = cv2.VideoCapture(camera_source, cv2.CAP_FFMPEG)
+    else:
+        camera = cv2.VideoCapture(int(camera_source))
+
     if not camera.isOpened():
         camera.release()
-        raise RuntimeError(f"Could not open camera index {camera_index}")
+        raise RuntimeError(f"Could not open camera source {camera_source!r}")
+
+    if is_stream:
+        # Keep only the latest frame so inference never processes stale frames.
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return camera
 
 
@@ -527,6 +548,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument(
+        "--camera-url",
+        default=None,
+        help="RTSP/HTTP stream URL. Takes precedence over --camera-index.",
+    )
+    parser.add_argument(
         "--device",
         choices=("auto", "cuda", "cpu"),
         default="auto",
@@ -606,7 +632,8 @@ class WebcamSession:
 
         self.model, self.processor, self.device = load_model(self.args.device)
         print(f"Selected device: {self.device}")
-        self.camera = open_camera(self.args.camera_index)
+        source = getattr(self.args, "camera_url", None) or self.args.camera_index
+        self.camera = open_camera(source)
         self.stream_started_at = time.monotonic()
 
     def capture_step(self) -> dict[str, Any]:
