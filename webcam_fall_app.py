@@ -7,6 +7,7 @@ from collections import deque
 from datetime import datetime
 import json
 from pathlib import Path
+import threading
 import time
 from typing import Any
 
@@ -598,6 +599,7 @@ class WebcamSession:
         self.last_inference_at = -float("inf")
         self.last_stream_seconds = 0.0
         self.last_latency_seconds: float | None = None
+        self.buffer_lock = threading.Lock()
 
     def open(self) -> None:
         """Load the model and open the camera."""
@@ -607,8 +609,8 @@ class WebcamSession:
         self.camera = open_camera(self.args.camera_index)
         self.stream_started_at = time.monotonic()
 
-    def step(self) -> dict[str, Any]:
-        """Read one camera frame, run inference if due, return the result."""
+    def capture_step(self) -> dict[str, Any]:
+        """Read one camera frame and update the buffer. Never blocks on inference."""
 
         ok, frame = self.camera.read()
         if not ok:
@@ -617,84 +619,14 @@ class WebcamSession:
         now = time.monotonic()
         stream_seconds = now - self.stream_started_at
         self.last_stream_seconds = stream_seconds
-        self.frame_buffer.append((stream_seconds, frame.copy()))
-        while (
-            self.frame_buffer
-            and stream_seconds - self.frame_buffer[0][0]
-            > self.args.buffer_seconds
-        ):
-            self.frame_buffer.popleft()
-
-        buffer_duration = (
-            self.frame_buffer[-1][0] - self.frame_buffer[0][0]
-            if len(self.frame_buffer) >= 2
-            else 0.0
-        )
-        inference_due = (
-            buffer_duration >= self.args.clip_seconds
-            and stream_seconds - self.last_inference_at
-            >= self.args.stride_seconds
-        )
-        saved_event: dict[str, Any] | None = None
-        if inference_due:
-            (
-                sampled_frames,
-                clip_start,
-                clip_end,
-                key_frame,
-            ) = sample_frames_from_buffer(
-                self.frame_buffer,
-                self.args.clip_seconds,
-                num_frames=16,
-            )
-            inference_start = time.monotonic()
-            try:
-                prediction = predict_frames(
-                    sampled_frames,
-                    self.model,
-                    self.processor,
-                    self.device,
-                )
-            except RuntimeError as exc:
-                if self.device.type != "cuda":
-                    raise
-                print(f"CUDA inference failed: {exc}")
-                print("Moving the model to CPU and continuing.")
-                self.device = torch.device("cpu")
-                try:
-                    self.model.to(self.device)
-                except RuntimeError:
-                    self.model, self.processor, self.device = load_model("cpu")
-                self.model.eval()
-                prediction = predict_frames(
-                    sampled_frames,
-                    self.model,
-                    self.processor,
-                    self.device,
-                )
-            self.last_latency_seconds = time.monotonic() - inference_start
-
-            self.current_prediction = make_prediction_row(
-                prediction,
-                clip_start,
-                clip_end,
-            )
-            self.current_prediction["_key_frame"] = key_frame
-            self.last_inference_at = stream_seconds
-            event = update_event_state(
-                self.current_prediction,
-                self.event_state,
-                self.args,
-            )
-            if event is not None:
-                saved_event = save_event_outputs(
-                    event,
-                    self.frame_buffer,
-                    self.output_dir,
-                )
-                _alert(saved_event)
-                self.latest_alert = saved_event
-                self.alert_expires_at = time.monotonic() + 5.0
+        with self.buffer_lock:
+            self.frame_buffer.append((stream_seconds, frame.copy()))
+            while (
+                self.frame_buffer
+                and stream_seconds - self.frame_buffer[0][0]
+                > self.args.buffer_seconds
+            ):
+                self.frame_buffer.popleft()
 
         if (
             self.latest_alert is not None
@@ -714,13 +646,125 @@ class WebcamSession:
             "frame": frame,
             "display_frame": display_frame,
             "stream_seconds": stream_seconds,
-            "inference_ran": inference_due,
+        }
+
+    def try_infer(self) -> dict[str, Any] | None:
+        """Run one inference cycle if due. Returns None immediately if not due yet.
+
+        Never queues backlog: always samples from whatever the buffer currently
+        holds, so a slow (e.g. CPU) inference pass simply results in a longer
+        effective interval between cycles rather than falling further behind.
+        """
+
+        with self.buffer_lock:
+            buffer_duration = (
+                self.frame_buffer[-1][0] - self.frame_buffer[0][0]
+                if len(self.frame_buffer) >= 2
+                else 0.0
+            )
+            stream_seconds = self.last_stream_seconds
+            inference_due = (
+                buffer_duration >= self.args.clip_seconds
+                and stream_seconds - self.last_inference_at
+                >= self.args.stride_seconds
+            )
+            buffer_snapshot = list(self.frame_buffer) if inference_due else None
+
+        if not inference_due or not buffer_snapshot:
+            return None
+
+        (
+            sampled_frames,
+            clip_start,
+            clip_end,
+            key_frame,
+        ) = sample_frames_from_buffer(
+            buffer_snapshot,
+            self.args.clip_seconds,
+            num_frames=16,
+        )
+        inference_start = time.monotonic()
+        try:
+            prediction = predict_frames(
+                sampled_frames,
+                self.model,
+                self.processor,
+                self.device,
+            )
+        except RuntimeError as exc:
+            if self.device.type != "cuda":
+                raise
+            print(f"CUDA inference failed: {exc}")
+            print("Moving the model to CPU and continuing.")
+            self.device = torch.device("cpu")
+            try:
+                self.model.to(self.device)
+            except RuntimeError:
+                self.model, self.processor, self.device = load_model("cpu")
+            self.model.eval()
+            prediction = predict_frames(
+                sampled_frames,
+                self.model,
+                self.processor,
+                self.device,
+            )
+        self.last_latency_seconds = time.monotonic() - inference_start
+
+        self.current_prediction = make_prediction_row(
+            prediction,
+            clip_start,
+            clip_end,
+        )
+        self.current_prediction["_key_frame"] = key_frame
+        self.last_inference_at = stream_seconds
+        event = update_event_state(
+            self.current_prediction,
+            self.event_state,
+            self.args,
+        )
+        saved_event: dict[str, Any] | None = None
+        if event is not None:
+            saved_event = save_event_outputs(
+                event,
+                buffer_snapshot,
+                self.output_dir,
+            )
+            _alert(saved_event)
+            self.latest_alert = saved_event
+            self.alert_expires_at = time.monotonic() + 5.0
+
+        return {
+            "inference_ran": True,
             "prediction": self.current_prediction,
-            "latency_seconds": (
-                self.last_latency_seconds if inference_due else None
-            ),
+            "stream_seconds": stream_seconds,
+            "latency_seconds": self.last_latency_seconds,
             "event": saved_event,
         }
+
+    def step(self) -> dict[str, Any]:
+        """Read one frame and run inference if due. Used by the single-threaded CLI."""
+
+        result = self.capture_step()
+        if not result["ok"]:
+            return result
+
+        inference_result = self.try_infer()
+        result["inference_ran"] = inference_result is not None
+        result["prediction"] = (
+            inference_result["prediction"] if inference_result else self.current_prediction
+        )
+        result["latency_seconds"] = (
+            inference_result["latency_seconds"] if inference_result else None
+        )
+        result["event"] = inference_result["event"] if inference_result else None
+        if inference_result is not None:
+            result["display_frame"] = draw_overlay(
+                result["frame"],
+                self.current_prediction,
+                self.event_state,
+                self.latest_alert,
+            )
+        return result
 
     def finalize(self) -> dict[str, Any] | None:
         """Flush a pending fall candidate at session end, if any."""

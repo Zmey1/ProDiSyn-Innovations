@@ -359,7 +359,7 @@ def predict_video_whole(
 def classify_events(
     df: pd.DataFrame,
     threshold: float = 0.7,
-    consecutive_required: int = 2,
+    consecutive_required: int = 1,
     recovery_window_seconds: float = 8.0,
     recovery_threshold: float = 0.5,
     ground_threshold: float = 0.5,

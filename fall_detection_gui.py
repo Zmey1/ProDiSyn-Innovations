@@ -123,7 +123,7 @@ class SingleVideoWorker(QThread):
                 device,
                 threshold=threshold,
             )
-            result = classify_events(clip_df, threshold=threshold)
+            result = classify_events(clip_df, threshold=threshold, consecutive_required=1)
             csv_path, json_path = write_report(
                 self.video_path,
                 device,
@@ -171,7 +171,7 @@ class BatchWorker(QThread):
                     device,
                     threshold=threshold,
                 )
-                result = classify_events(clip_df, threshold=threshold)
+                result = classify_events(clip_df, threshold=threshold, consecutive_required=1)
                 out_dir = BATCH_OUTPUT_DIR / video_path.stem
                 write_report(
                     video_path,
@@ -252,11 +252,11 @@ class WebcamFinalizeWorker(QThread):
         self.session.close()
 
 
-class WebcamStepWorker(QThread):
-    """Runs the capture+inference loop off the GUI thread so a ~330ms
-    inference call no longer freezes the video preview and UI once a second."""
+class WebcamCaptureWorker(QThread):
+    """Continuously reads camera frames on its own thread so the preview stays
+    live regardless of how long inference takes on the inference thread."""
 
-    stepped = pyqtSignal(dict)
+    captured = pyqtSignal(dict)
 
     def __init__(self, session: WebcamSession):
         super().__init__()
@@ -268,10 +268,34 @@ class WebcamStepWorker(QThread):
 
     def run(self) -> None:
         while not self._should_stop:
-            result = self.session.step()
-            self.stepped.emit(result)
+            result = self.session.capture_step()
+            self.captured.emit(result)
             if not result["ok"]:
                 break
+
+
+class WebcamInferenceWorker(QThread):
+    """Runs inference cycles on its own thread whenever they're due, never
+    blocking camera capture. Naturally self-throttles to whatever cadence the
+    hardware can sustain instead of queuing backlog when inference is slow."""
+
+    inferred = pyqtSignal(dict)
+
+    def __init__(self, session: WebcamSession):
+        super().__init__()
+        self.session = session
+        self._should_stop = False
+
+    def request_stop(self) -> None:
+        self._should_stop = True
+
+    def run(self) -> None:
+        while not self._should_stop:
+            result = self.session.try_infer()
+            if result is not None:
+                self.inferred.emit(result)
+            else:
+                self.msleep(50)
 
 
 class FallDetectionGUI(QMainWindow):
@@ -501,7 +525,10 @@ class WebcamTab(QWidget):
         self._last_summary: dict[str, Any] | None = None
         self.open_worker: WebcamOpenWorker | None = None
         self.finalize_worker: WebcamFinalizeWorker | None = None
-        self.step_worker: WebcamStepWorker | None = None
+        self.capture_worker: WebcamCaptureWorker | None = None
+        self.inference_worker: WebcamInferenceWorker | None = None
+        self._capture_stopped = False
+        self._inference_stopped = False
         self._pending_stop_reason: str | None = None
         self._build_widgets()
 
@@ -590,17 +617,26 @@ class WebcamTab(QWidget):
         self.alerts_fired = 0
         self.start_time = time.monotonic()
         self.stop_button.setEnabled(True)
-        self.step_worker = WebcamStepWorker(self.session)
-        self.step_worker.stepped.connect(self._on_step)
-        self.step_worker.start()
+        self._capture_stopped = False
+        self._inference_stopped = False
+        self.capture_worker = WebcamCaptureWorker(self.session)
+        self.capture_worker.captured.connect(self._on_captured)
+        self.inference_worker = WebcamInferenceWorker(self.session)
+        self.inference_worker.inferred.connect(self._on_inferred)
+        self.capture_worker.start()
+        self.inference_worker.start()
 
-    def _on_step(self, result: dict[str, Any]) -> None:
+    def _on_captured(self, result: dict[str, Any]) -> None:
         if not self.running or self.session is None:
             return
         if not result["ok"]:
             self.stop(reason="Camera frame read failed.")
             return
         self._render_frame(result["display_frame"])
+
+    def _on_inferred(self, result: dict[str, Any]) -> None:
+        if not self.running or self.session is None:
+            return
         if result["latency_seconds"] is not None:
             self.latencies.append(result["latency_seconds"])
         if result["event"] is not None:
@@ -628,16 +664,19 @@ class WebcamTab(QWidget):
         avg_latency = (
             sum(self.latencies) / len(self.latencies) if self.latencies else 0.0
         )
-        lag_note = ""
-        if self.session is not None and avg_latency > self.session.args.stride_seconds:
-            lag_note = "   WARNING: falling behind real-time"
+        stride = self.session.args.stride_seconds if self.session is not None else 0.0
+        effective = max(stride, avg_latency)
+        cadence_note = (
+            f"   Effective analysis interval: ~{effective:.2f}s "
+            f"(configured stride: {stride:.2f}s)"
+        )
         latency_text = f"{latency:.2f}s" if latency is not None else "-"
         text = (
             f"Stream time: {result['stream_seconds']:.1f}s   "
             f"Last clip latency: {latency_text}\n"
             f"Avg latency: {avg_latency:.2f}s   "
             f"Clips processed: {len(self.latencies)}   "
-            f"Alerts: {self.alerts_fired}{lag_note}"
+            f"Alerts: {self.alerts_fired}{cadence_note}"
         )
         self.stats_label.setText(text)
 
@@ -648,13 +687,32 @@ class WebcamTab(QWidget):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self._pending_stop_reason = reason
-        if self.step_worker is not None and self.step_worker.isRunning():
-            self.step_worker.request_stop()
-            self.step_worker.finished.connect(self._on_step_worker_finished)
-        else:
-            self._on_step_worker_finished()
 
-    def _on_step_worker_finished(self) -> None:
+        if self.capture_worker is not None and self.capture_worker.isRunning():
+            self.capture_worker.request_stop()
+            self.capture_worker.finished.connect(self._on_capture_worker_finished)
+        else:
+            self._capture_stopped = True
+
+        if self.inference_worker is not None and self.inference_worker.isRunning():
+            self.inference_worker.request_stop()
+            self.inference_worker.finished.connect(self._on_inference_worker_finished)
+        else:
+            self._inference_stopped = True
+
+        self._maybe_finalize_after_stop()
+
+    def _on_capture_worker_finished(self) -> None:
+        self._capture_stopped = True
+        self._maybe_finalize_after_stop()
+
+    def _on_inference_worker_finished(self) -> None:
+        self._inference_stopped = True
+        self._maybe_finalize_after_stop()
+
+    def _maybe_finalize_after_stop(self) -> None:
+        if not (self._capture_stopped and self._inference_stopped):
+            return
         session = self.session
         if session is not None:
             self.finalize_worker = WebcamFinalizeWorker(session)
