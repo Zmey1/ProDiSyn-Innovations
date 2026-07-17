@@ -18,6 +18,8 @@ from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSlider,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -37,13 +40,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import pandas as pd
+
 from test_fall_model import (
     OUTPUT_DIR,
     classify_events,
     load_model,
     time_predictions,
 )
-from webcam_fall_app import DEFAULT_OUTPUT_DIR, WebcamSession
+from webcam_fall_app import DEFAULT_OUTPUT_DIR, WebcamSession, draw_overlay
 
 BATCH_OUTPUT_DIR = OUTPUT_DIR / "batch"
 VIDEO_FILETYPES = "Video files (*.mp4 *.avi *.mov *.mkv);;All files (*)"
@@ -102,6 +107,7 @@ def write_report(
 class AppSettings:
     device: str = "auto"
     threshold: float = 0.7
+    alert_sound: bool = True
 
 
 class SingleVideoWorker(QThread):
@@ -299,6 +305,235 @@ class WebcamInferenceWorker(QThread):
                 self.msleep(50)
 
 
+def _load_playback_inputs(out_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read the saved per-clip scores and events for overlay playback.
+
+    Both the Single Video and Batch tabs already write these reports via
+    ``write_report``; playback reuses them instead of re-running inference.
+    """
+
+    csv_path = out_dir / "fall_clip_scores.csv"
+    json_path = out_dir / "fall_events.json"
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Missing clip scores: {csv_path}")
+    clip_rows = pd.read_csv(csv_path).to_dict("records")
+    events: list[dict[str, Any]] = []
+    if json_path.is_file():
+        events = json.loads(json_path.read_text()).get("events", [])
+    return clip_rows, events
+
+
+class VideoPlaybackWorker(QThread):
+    """Replays a video at real-time speed, drawing the same overlay the webcam
+    view uses. Per-frame label/state/alert are looked up from the pre-computed
+    clip scores and events, so no inference runs during playback."""
+
+    frame_ready = pyqtSignal(object, float, float)
+    finished_playback = pyqtSignal()
+
+    def __init__(
+        self,
+        video_path: Path,
+        clip_rows: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+        fps: float,
+    ):
+        super().__init__()
+        self.video_path = video_path
+        self.clip_rows = sorted(clip_rows, key=lambda row: row["start_seconds"])
+        self.events = events
+        self.fps = fps if fps and fps > 0 else 30.0
+        self._should_stop = False
+        self._paused = False
+        self._seek_frame: int | None = None
+
+    def request_stop(self) -> None:
+        self._should_stop = True
+
+    def set_paused(self, paused: bool) -> None:
+        self._paused = paused
+
+    def seek(self, frame_index: int) -> None:
+        self._seek_frame = max(0, frame_index)
+
+    def _prediction_for(self, seconds: float) -> dict[str, Any]:
+        chosen = self.clip_rows[0] if self.clip_rows else None
+        for row in self.clip_rows:
+            if row["start_seconds"] <= seconds:
+                chosen = row
+            else:
+                break
+        if chosen is None:
+            return {"top_label": "unknown", "fall_down_score": 0.0}
+        return {
+            "top_label": str(chosen["top_label"]),
+            "fall_down_score": float(chosen["fall_down_score"]),
+        }
+
+    def _state_for(
+        self, seconds: float
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        phase = "no_active_event"
+        latest_alert: dict[str, Any] | None = None
+        for event in self.events:
+            fall_start = float(event["fall_start_seconds"])
+            fall_end = float(event["fall_end_seconds"])
+            window = float(event.get("recovery_window_seconds", 8.0))
+            if fall_start <= seconds <= fall_end:
+                phase = "fall_candidate_active"
+            elif fall_end < seconds <= fall_end + window:
+                phase = "waiting_for_recovery"
+            if seconds >= fall_end:
+                latest_alert = {"event_type": event["event_type"]}
+        return {"phase": phase}, latest_alert
+
+    def run(self) -> None:
+        capture = cv2.VideoCapture(str(self.video_path))
+        if not capture.isOpened():
+            capture.release()
+            self.finished_playback.emit()
+            return
+        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / self.fps if total_frames > 0 else 0.0
+        frame_interval_ms = int(round(1000.0 / self.fps))
+
+        try:
+            while not self._should_stop:
+                if self._seek_frame is not None:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, self._seek_frame)
+                    self._seek_frame = None
+                if self._paused:
+                    self.msleep(40)
+                    continue
+                frame_index = int(capture.get(cv2.CAP_PROP_POS_FRAMES))
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                seconds = frame_index / self.fps
+                prediction = self._prediction_for(seconds)
+                event_state, latest_alert = self._state_for(seconds)
+                display = draw_overlay(
+                    frame, prediction, event_state, latest_alert, hint_text=""
+                )
+                self.frame_ready.emit(display, seconds, duration)
+                self.msleep(frame_interval_ms)
+        finally:
+            capture.release()
+        self.finished_playback.emit()
+
+
+class VideoPlaybackWidget(QWidget):
+    """Reusable embedded player: video area, play/pause, stop, and a seek bar.
+    Only one clip plays at a time; loading a new one stops the previous."""
+
+    def __init__(self):
+        super().__init__()
+        self.worker: VideoPlaybackWorker | None = None
+        self._fps: float = 30.0
+        self._scrubbing = False
+        self._build_widgets()
+
+    def _build_widgets(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.video_label = QLabel()
+        self.video_label.setFixedSize(640, 480)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setStyleSheet("background-color: #1b1e24; border-radius: 4px;")
+        layout.addWidget(self.video_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("Pause")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self._toggle_pause)
+        controls.addWidget(self.play_button)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_playback)
+        controls.addWidget(self.stop_button)
+        self.seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self.seek_slider.setEnabled(False)
+        self.seek_slider.sliderPressed.connect(self._on_scrub_start)
+        self.seek_slider.sliderReleased.connect(self._on_scrub_end)
+        controls.addWidget(self.seek_slider, stretch=1)
+        self.time_label = QLabel("0.0 / 0.0s")
+        controls.addWidget(self.time_label)
+        layout.addLayout(controls)
+
+    def load_and_play(self, video_path: Path, out_dir: Path) -> None:
+        self.stop_playback()
+        try:
+            clip_rows, events = _load_playback_inputs(out_dir)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Playback", f"Could not load results: {exc}")
+            return
+
+        probe = cv2.VideoCapture(str(video_path))
+        if not probe.isOpened():
+            probe.release()
+            QMessageBox.warning(self, "Playback", f"Could not open video: {video_path}")
+            return
+        self._fps = float(probe.get(cv2.CAP_PROP_FPS)) or 30.0
+        total_frames = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
+        probe.release()
+
+        self.seek_slider.setRange(0, max(0, total_frames - 1))
+        self.seek_slider.setValue(0)
+        self.seek_slider.setEnabled(True)
+        self.play_button.setText("Pause")
+        self.play_button.setEnabled(True)
+        self.stop_button.setEnabled(True)
+
+        self.worker = VideoPlaybackWorker(video_path, clip_rows, events, self._fps)
+        self.worker.frame_ready.connect(self._on_frame)
+        self.worker.finished_playback.connect(self._on_finished)
+        self.worker.start()
+
+    def _toggle_pause(self) -> None:
+        if self.worker is None:
+            return
+        paused = self.play_button.text() == "Pause"
+        self.worker.set_paused(paused)
+        self.play_button.setText("Play" if paused else "Pause")
+
+    def _on_scrub_start(self) -> None:
+        self._scrubbing = True
+
+    def _on_scrub_end(self) -> None:
+        self._scrubbing = False
+        if self.worker is not None:
+            self.worker.seek(self.seek_slider.value())
+
+    def _on_frame(self, frame_bgr, seconds: float, duration: float) -> None:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(image).scaled(
+            640,
+            480,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.video_label.setPixmap(pixmap)
+        if not self._scrubbing:
+            self.seek_slider.setValue(int(round(seconds * self._fps)))
+        self.time_label.setText(f"{seconds:.1f} / {duration:.1f}s")
+
+    def _on_finished(self) -> None:
+        self.play_button.setText("Pause")
+        self.play_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.seek_slider.setEnabled(False)
+
+    def stop_playback(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.request_stop()
+            self.worker.wait(2000)
+        self.worker = None
+        self._on_finished()
+
+
 class FallDetectionGUI(QMainWindow):
     """Owns shared state (settings, model cache) across all tabs."""
 
@@ -338,6 +573,8 @@ class FallDetectionGUI(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self.webcam_tab.running:
             self.webcam_tab.stop(reason="window closed")
+        self.single_tab.playback.stop_playback()
+        self.batch_tab.playback.stop_playback()
         event.accept()
 
 
@@ -369,7 +606,21 @@ class SingleVideoTab(QWidget):
 
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
+        self.result_text.setMaximumHeight(160)
         layout.addWidget(self.result_text)
+
+        self.play_button = QPushButton("Play with overlay")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self._play)
+        layout.addWidget(self.play_button)
+
+        self.playback = VideoPlaybackWidget()
+        layout.addWidget(self.playback)
+
+    def _play(self) -> None:
+        if self.video_path is None:
+            return
+        self.playback.load_and_play(self.video_path, OUTPUT_DIR)
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select a video", "", VIDEO_FILETYPES)
@@ -378,11 +629,15 @@ class SingleVideoTab(QWidget):
         self.video_path = Path(path)
         self.path_label.setText(str(self.video_path))
         self.run_button.setEnabled(True)
+        self.playback.stop_playback()
+        self.play_button.setEnabled(False)
 
     def _run(self) -> None:
         if self.video_path is None:
             return
         self.run_button.setEnabled(False)
+        self.playback.stop_playback()
+        self.play_button.setEnabled(False)
         self.status_label.setText("Loading model / analyzing...")
         self.result_text.setPlainText("")
         self.worker = SingleVideoWorker(self.app, self.video_path)
@@ -433,6 +688,7 @@ class SingleVideoTab(QWidget):
             lines.append("No fall candidates detected.")
         self.result_text.setPlainText("\n".join(lines))
         self.run_button.setEnabled(True)
+        self.play_button.setEnabled(True)
 
 
 class BatchTab(QWidget):
@@ -441,6 +697,7 @@ class BatchTab(QWidget):
         self.app = app
         self.video_paths: list[Path] = []
         self.worker: BatchWorker | None = None
+        self.rows: list[dict[str, Any]] = []
         self._build_widgets()
 
     def _build_widgets(self) -> None:
@@ -470,6 +727,32 @@ class BatchTab(QWidget):
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
 
+        playback_row = QHBoxLayout()
+        playback_row.addWidget(QLabel("Review:"))
+        self.review_combo = QComboBox()
+        self.review_combo.setEnabled(False)
+        self.review_combo.setMinimumWidth(260)
+        playback_row.addWidget(self.review_combo)
+        self.play_button = QPushButton("Play with overlay")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self._play_selected)
+        playback_row.addWidget(self.play_button)
+        playback_row.addStretch(1)
+        layout.addLayout(playback_row)
+
+        self.playback = VideoPlaybackWidget()
+        layout.addWidget(self.playback)
+
+    def _play_selected(self) -> None:
+        index = self.review_combo.currentIndex()
+        if index < 0:
+            return
+        data = self.review_combo.itemData(index)
+        if data is None:
+            return
+        video_path, out_dir = data
+        self.playback.load_and_play(Path(video_path), Path(out_dir))
+
     def _browse(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Select videos", "", VIDEO_FILETYPES)
         if not paths:
@@ -484,6 +767,11 @@ class BatchTab(QWidget):
             return
         self.run_button.setEnabled(False)
         self.table.setRowCount(0)
+        self.rows = []
+        self.playback.stop_playback()
+        self.review_combo.clear()
+        self.review_combo.setEnabled(False)
+        self.play_button.setEnabled(False)
         self.worker = BatchWorker(self.app, self.video_paths)
         self.worker.load_failed.connect(self._on_load_error)
         self.worker.status.connect(self.status_label.setText)
@@ -492,6 +780,7 @@ class BatchTab(QWidget):
         self.worker.start()
 
     def _add_row(self, row: dict[str, Any]) -> None:
+        self.rows.append(row)
         row_index = self.table.rowCount()
         self.table.insertRow(row_index)
         values = (
@@ -512,6 +801,16 @@ class BatchTab(QWidget):
     def _on_done(self, summary_csv: Path) -> None:
         self.status_label.setText(f"Done. Summary: {summary_csv}")
         self.run_button.setEnabled(True)
+        self.review_combo.clear()
+        for row in self.rows:
+            if row["decision"] == "Error":
+                continue
+            video_path = Path(row["video"])
+            out_dir = BATCH_OUTPUT_DIR / video_path.stem
+            self.review_combo.addItem(video_path.name, (str(video_path), str(out_dir)))
+        has_playable = self.review_combo.count() > 0
+        self.review_combo.setEnabled(has_playable)
+        self.play_button.setEnabled(has_playable)
 
 
 class WebcamTab(QWidget):
@@ -654,6 +953,10 @@ class WebcamTab(QWidget):
                 f"ALERT: {result['event'].get('event_type', 'Fall')} at "
                 f"{result['stream_seconds']:.1f}s"
             )
+            if self.app.settings.alert_sound:
+                app = QApplication.instance()
+                if app is not None:
+                    app.beep()
         self._update_stats(result)
 
     def _render_frame(self, frame_bgr) -> None:
@@ -795,14 +1098,18 @@ class SettingsTab(QWidget):
         self.threshold_spin.setValue(self.app.settings.threshold)
         grid.addWidget(self.threshold_spin, 1, 1)
 
+        self.alert_sound_check = QCheckBox("Play alert sound (live webcam/RTSP only)")
+        self.alert_sound_check.setChecked(self.app.settings.alert_sound)
+        grid.addWidget(self.alert_sound_check, 2, 0, 1, 4)
+
         apply_button = QPushButton("Apply")
         apply_button.clicked.connect(self._apply)
-        grid.addWidget(apply_button, 2, 0)
+        grid.addWidget(apply_button, 3, 0)
 
         self.info_label = QLabel("")
         self.info_label.setStyleSheet("color: #b00020;")
         self.info_label.setWordWrap(True)
-        grid.addWidget(self.info_label, 3, 0, 1, 4)
+        grid.addWidget(self.info_label, 4, 0, 1, 4)
 
         layout.addStretch(1)
         self._refresh_info()
@@ -813,6 +1120,7 @@ class SettingsTab(QWidget):
                 self.app.settings.device = button.property("device_value")
                 break
         self.app.settings.threshold = float(self.threshold_spin.value())
+        self.app.settings.alert_sound = self.alert_sound_check.isChecked()
         self._refresh_info()
 
     def _refresh_info(self) -> None:

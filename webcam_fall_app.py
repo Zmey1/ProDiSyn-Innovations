@@ -448,8 +448,13 @@ def draw_overlay(
     current_prediction: dict[str, Any] | None,
     event_state: dict[str, Any],
     latest_alert: dict[str, Any] | None,
+    hint_text: str = "Press q to quit",
 ) -> np.ndarray:
-    """Draw current prediction, state, and recent alert on a webcam frame."""
+    """Draw current prediction, state, and recent alert on a webcam frame.
+
+    ``hint_text`` is the small bottom-left hint line; callers replaying a file
+    in a GUI (where there is no ``q`` key) can pass ``""`` to hide it.
+    """
 
     output = frame.copy()
     if current_prediction is None:
@@ -492,16 +497,17 @@ def draw_overlay(
             2,
             cv2.LINE_AA,
         )
-    cv2.putText(
-        output,
-        "Press q to quit",
-        (20, output.shape[0] - 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (220, 220, 220),
-        1,
-        cv2.LINE_AA,
-    )
+    if hint_text:
+        cv2.putText(
+            output,
+            hint_text,
+            (20, output.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
     return output
 
 
